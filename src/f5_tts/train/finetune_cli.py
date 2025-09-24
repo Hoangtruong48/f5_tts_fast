@@ -316,12 +316,10 @@ def main():
         tokenizer_type_for_init = args.tokenizer
         print(f"Using default tokenizer associated with dataset '{args.dataset_name}' and type '{tokenizer_type_for_init}'")
 
-
     # --- Get Tokenizer Map and Correct Vocab Size ---
     print(f"Calling get_tokenizer with source='{path_or_alias_for_get_tokenizer}', type='{tokenizer_type_for_init}'")
     vocab_char_map, vocab_size = get_tokenizer(path_or_alias_for_get_tokenizer, tokenizer_type_for_init)
     print(f"\nDetermined Vocab Size for Model Init: {vocab_size}") # CRITICAL: Must match checkpoint
-
 
     # --- Define mel_spec_kwargs HERE ---
     mel_spec_kwargs = dict(
@@ -332,7 +330,6 @@ def main():
         target_sample_rate=target_sample_rate,
         mel_spec_type=mel_spec_type,
     )
-
 
     # --- Model Instantiation ---
     if model_cls is None or model_cfg is None: raise RuntimeError("Model class or config was not set correctly.")
@@ -372,7 +369,6 @@ def main():
             print(f"Current learning rate: {args.learning_rate}")
     
     print("Model Initialized.")
-
 
     # --- Copy Checkpoint for Trainer (Only if fine-tuning and not from scratch) ---
     # The Trainer will load from target_dataset_ckpt_dir

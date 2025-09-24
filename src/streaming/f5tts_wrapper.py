@@ -2,6 +2,7 @@ import os
 import torch
 import torchaudio
 import numpy as np
+import re
 from pathlib import Path
 from typing import Optional, Union, List, Tuple, Dict
 
@@ -638,31 +639,9 @@ class F5TTSWrapper:
             speed: Optional[float] = None,
             fix_duration: Optional[float] = None,
             cross_fade_duration: Optional[float] = None,
-            use_duration_predictor: Optional[bool] = None,
-            return_numpy: bool = False,
-            return_spectrogram: bool = False,
+            use_duration_predictor: Optional[bool] = None
     ) -> ndarray:
-        """
-        Generate speech for the given text using the stored reference audio.
 
-        Args:
-            text: Text to synthesize
-            output_path: Path to save the generated audio. If None, won't save.
-            nfe_step: Number of function evaluation steps
-            cfg_strength: Classifier-free guidance strength
-            sway_sampling_coef: Sway sampling coefficient
-            speed: Speed of generated audio
-            fix_duration: Fixed duration in seconds
-            cross_fade_duration: Duration of cross-fade between segments
-            use_duration_predictor: Override default setting for using duration predictor
-            return_numpy: If True, returns the audio as a numpy array
-            return_spectrogram: If True, also returns the spectrogram
-
-        Returns:
-            If output_path provided: path to output file
-            If return_numpy=True: tuple of (audio_array, sample_rate)
-            If return_spectrogram=True: tuple of (audio_array, sample_rate, spectrogram)
-        """
         if self.ref_audio_processed is None or self.ref_text is None:
             raise ValueError("Reference audio not preprocessed. Call preprocess_reference() first.")
 
@@ -681,9 +660,8 @@ class F5TTSWrapper:
         # Split the input text into batches
         audio_len = self.ref_audio_processed.shape[-1] / self.target_sample_rate
         max_chars = int(len(self.ref_text.encode("utf-8")) / audio_len * (22 - audio_len))
-        # max_chars = max(50, min(max_chars, 135))
-        # print("CHar")
-        text_batches = chunk_text(text, max_chars=max_chars)
+        max_chars = min(150, int(len(self.ref_text.encode("utf-8")) / max(1, audio_len) * (22 - audio_len)))
+        text_batches = split_long_sentences(text, max_chars)
 
         for i, text_batch in enumerate(text_batches):
             print(f"Text batch {i}: {text_batch}")
@@ -726,6 +704,7 @@ class F5TTSWrapper:
                 ref_text_len = len(self.ref_text.encode("utf-8"))
                 gen_text_len = len(text_batch.encode("utf-8"))
                 duration = self.ref_audio_len + int(self.ref_audio_len / ref_text_len * gen_text_len / local_speed)
+                # duration = min(duration, int(self.target_sample_rate * 30 / self.hop_length))
                 print(f"Calculated duration based on text ratio: {duration} frames")
 
             # Generate audio
@@ -803,3 +782,352 @@ class F5TTSWrapper:
             return final_wave
         else:
             raise RuntimeError("No audio generated")
+
+    # # Lưu lại hàm gốc
+    # _orig_forward = spectral_ops.InverseSTFT.forward
+    #
+    # def _patched_forward(self, spec):
+    #     try:
+    #         # ép center=False
+    #         return torch.istft(
+    #             spec, self.n_fft, self.hop_length, self.win_length, self.window, center=False
+    #         )
+    #     except RuntimeError as e:
+    #         if "cuFFT" in str(e):
+    #             print("⚠️ cuFFT lỗi, fallback CPU")
+    #             return torch.istft(
+    #                 spec.cpu(), self.n_fft, self.hop_length, self.win_length, self.window.cpu(), center=False
+    #             ).to(spec.device)
+    #         else:
+    #             raise
+    #
+    # # Monkey patch
+    # spectral_ops.InverseSTFT.forward = _patched_forward
+
+    def generate_wav_only_v2(
+            self,
+            text: str,
+            nfe_step: Optional[int] = None,
+            cfg_strength: Optional[float] = None,
+            sway_sampling_coef: Optional[float] = None,
+            speed: Optional[float] = None,
+            fix_duration: Optional[float] = None,
+            cross_fade_duration: Optional[float] = None,
+            use_duration_predictor: Optional[bool] = None,
+    ) -> ndarray:
+        if self.ref_audio_processed is None or self.ref_text is None:
+            raise ValueError("Reference audio not preprocessed. Call preprocess_reference() first.")
+
+        # Use default values if not specified
+        nfe_step = nfe_step if nfe_step is not None else self.nfe_step
+        cfg_strength = cfg_strength if cfg_strength is not None else self.cfg_strength
+        sway_sampling_coef = sway_sampling_coef if sway_sampling_coef is not None else self.sway_sampling_coef
+        speed = speed if speed is not None else self.speed
+        fix_duration = fix_duration if fix_duration is not None else self.fix_duration
+        cross_fade_duration = cross_fade_duration if cross_fade_duration is not None else self.cross_fade_duration
+        use_predictor = use_duration_predictor if use_duration_predictor is not None else self.use_duration_predictor
+
+        # Check if we can use the duration predictor
+        can_use_predictor = use_predictor and self.has_duration_predictor
+
+        # Split the input text into batches
+        audio_len = self.ref_audio_processed.shape[-1] / self.target_sample_rate
+        max_chars = min(200, int(len(self.ref_text.encode("utf-8")) / max(1, audio_len) * (22 - audio_len)))
+        text_batches = chunk_text(text, max_chars=max_chars)
+
+        for i, text_batch in enumerate(text_batches):
+            print(f"Text batch {i}: {text_batch}")
+        print("\n")
+
+        # Generate audio for each batch
+        generated_waves = []
+        device = next(self.vocoder.parameters()).device
+
+        for text_batch in text_batches:
+            # Adjust speed for very short texts
+            local_speed = speed
+            if len(text_batch.encode("utf-8")) < 10:
+                local_speed = 0.3
+
+            # Prepare the text
+            text_list = [self.ref_text + text_batch]
+            final_text_list = convert_char_to_pinyin(text_list)
+
+            # Calculate duration
+            if fix_duration is not None:
+                duration = int(fix_duration * self.target_sample_rate / self.hop_length)
+                print(f"Using fixed duration: {fix_duration}s ({duration} frames)")
+            elif can_use_predictor:
+                if isinstance(final_text_list[0], str):
+                    text_tokens = list_str_to_idx(final_text_list, self.vocab_char_map).to(self.device)
+                else:
+                    text_tokens = torch.tensor(final_text_list, device=self.device)
+                text_lengths = torch.tensor([len(t) for t in final_text_list], device=self.device)
+                duration = self.calculate_duration_with_predictor(text_tokens, text_lengths, local_speed)
+                print(f"Duration predictor output: {duration} frames")
+            else:
+                ref_text_len = len(self.ref_text.encode("utf-8"))
+                gen_text_len = len(text_batch.encode("utf-8"))
+                duration = self.ref_audio_len + int(self.ref_audio_len / ref_text_len * gen_text_len / local_speed)
+                # Giới hạn max 30s / segment
+                duration = min(duration, int(self.target_sample_rate * 30 / self.hop_length))
+                print(f"Calculated duration based on text ratio: {duration} frames")
+
+            # Generate audio
+            with torch.inference_mode():
+                generated, _ = self.model.sample(
+                    cond=self.ref_audio_processed,
+                    text=final_text_list,
+                    duration=duration,
+                    steps=nfe_step,
+                    cfg_strength=cfg_strength,
+                    sway_sampling_coef=sway_sampling_coef,
+                )
+
+            # Process the generated mel spectrogram
+            generated = (
+                generated[:, self.ref_audio_len:, :]
+                    .permute(0, 2, 1)
+                    .to(dtype=torch.float32, device=device)
+            )
+
+            # Vocoder
+            if self.mel_spec_type == "vocos":
+                with torch.cuda.amp.autocast(dtype=torch.float16):
+                    generated_wave = self.vocoder.decode(generated)
+            elif self.mel_spec_type == "bigvgan":
+                generated_wave = self.vocoder(generated)
+            else:
+                raise ValueError(f"Unsupported mel_spec_type: {self.mel_spec_type}")
+
+            # Convert to numpy
+            generated_wave = generated_wave.squeeze().detach().cpu().numpy()
+
+            # Normalize volume trên chính output
+            rms = np.sqrt(np.mean(generated_wave ** 2))
+            if rms > 1e-6:
+                generated_wave *= self.target_rms / rms
+
+            generated_waves.append(generated_wave)
+
+        # Combine all segments
+        if not generated_waves:
+            raise RuntimeError("No audio generated")
+
+        if cross_fade_duration <= 0:
+            final_wave = np.concatenate(generated_waves)
+        else:
+            final_wave = generated_waves[0]
+            for i in range(1, len(generated_waves)):
+                prev_wave = final_wave
+                next_wave = generated_waves[i]
+
+                cross_fade_samples = int(cross_fade_duration * self.target_sample_rate)
+                cross_fade_samples = min(cross_fade_samples, len(prev_wave), len(next_wave))
+
+                if cross_fade_samples <= 0:
+                    final_wave = np.concatenate([prev_wave, next_wave])
+                    continue
+
+                prev_overlap = prev_wave[-cross_fade_samples:]
+                next_overlap = next_wave[:cross_fade_samples]
+
+                fade_out = np.linspace(1, 0, cross_fade_samples)
+                fade_in = np.linspace(0, 1, cross_fade_samples)
+
+                cross_faded_overlap = prev_overlap * fade_out + next_overlap * fade_in
+
+                final_wave = np.concatenate([
+                    prev_wave[:-cross_fade_samples],
+                    cross_faded_overlap,
+                    next_wave[cross_fade_samples:]
+                ])
+
+        return final_wave
+
+    def generate_wav_only_v3(
+            self,
+            text: str,
+            nfe_step: Optional[int] = None,
+            cfg_strength: Optional[float] = None,
+            sway_sampling_coef: Optional[float] = None,
+            speed: Optional[float] = None,
+            fix_duration: Optional[float] = None,
+            cross_fade_duration: Optional[float] = None,
+            use_duration_predictor: Optional[bool] = None
+    ) -> ndarray:
+        if self.ref_audio_processed is None or self.ref_text is None:
+            raise ValueError("Reference audio not preprocessed. Call preprocess_reference() first.")
+
+        # Default params
+        nfe_step = nfe_step if nfe_step is not None else self.nfe_step
+        cfg_strength = cfg_strength if cfg_strength is not None else self.cfg_strength
+        sway_sampling_coef = sway_sampling_coef if sway_sampling_coef is not None else self.sway_sampling_coef
+        speed = speed if speed is not None else self.speed
+        fix_duration = fix_duration if fix_duration is not None else self.fix_duration
+        cross_fade_duration = cross_fade_duration if cross_fade_duration is not None else self.cross_fade_duration
+        use_predictor = use_duration_predictor if use_duration_predictor is not None else self.use_duration_predictor
+
+        can_use_predictor = use_predictor and self.has_duration_predictor
+
+        # Tính max_chars dựa trên ref_audio
+        audio_len = self.ref_audio_processed.shape[-1] / self.target_sample_rate
+        max_chars = int(len(self.ref_text.encode("utf-8")) / audio_len * (22 - audio_len))
+        text_batches = chunk_text(text, max_chars=max_chars)
+
+        generated_waves = []
+
+        for text_batch in text_batches:
+            local_speed = speed
+            if len(text_batch.encode("utf-8")) < 10:
+                local_speed = 0.3
+
+            text_list = [self.ref_text + text_batch]
+            final_text_list = convert_char_to_pinyin(text_list)
+
+            # Tính duration
+            if fix_duration is not None:
+                duration = int(fix_duration * self.target_sample_rate / self.hop_length)
+            elif can_use_predictor:
+                if isinstance(final_text_list[0], str):
+                    text_tokens = list_str_to_idx(final_text_list, self.vocab_char_map).to(self.device)
+                else:
+                    text_tokens = torch.tensor(final_text_list, device=self.device)
+                text_lengths = torch.tensor([len(t) for t in final_text_list], device=self.device)
+                duration = self.calculate_duration_with_predictor(text_tokens, text_lengths, local_speed)
+            else:
+                ref_text_len = len(self.ref_text.encode("utf-8"))
+                gen_text_len = len(text_batch.encode("utf-8"))
+                duration = self.ref_audio_len + int(self.ref_audio_len / ref_text_len * gen_text_len / local_speed)
+
+            # Generate spectrogram
+            with torch.inference_mode():
+                generated, _ = self.model.sample(
+                    cond=self.ref_audio_processed,
+                    text=final_text_list,
+                    duration=duration,
+                    steps=nfe_step,
+                    cfg_strength=cfg_strength,
+                    sway_sampling_coef=sway_sampling_coef,
+                )
+
+            # Process spectrogram → audio
+            generated = generated.to(torch.float32)  # giữ float32 để tránh slowdown vocoder
+            generated = generated[:, self.ref_audio_len:, :]
+            generated = generated.permute(0, 2, 1)
+            generated = generated.to(next(self.vocoder.parameters()).device)
+
+            if self.mel_spec_type == "vocos":
+                generated_wave = self.vocoder.decode(generated)
+            elif self.mel_spec_type == "bigvgan":
+                generated_wave = self.vocoder(generated)
+
+            # Normalize bằng numpy (nhanh hơn GPU sync)
+            generated_wave = generated_wave.squeeze().cpu().numpy()
+            rms = np.sqrt(np.mean(generated_wave ** 2))
+            if rms > 1e-6:
+                generated_wave = generated_wave * (self.target_rms / rms)
+
+            generated_waves.append(generated_wave)
+
+        # Ghép các đoạn
+        if not generated_waves:
+            raise RuntimeError("No audio generated")
+
+        if cross_fade_duration <= 0:
+            final_wave = np.concatenate(generated_waves)
+        else:
+            final_wave = generated_waves[0]
+            for i in range(1, len(generated_waves)):
+                prev_wave = final_wave
+                next_wave = generated_waves[i]
+
+                cross_fade_samples = int(cross_fade_duration * self.target_sample_rate)
+                cross_fade_samples = min(cross_fade_samples, len(prev_wave), len(next_wave))
+
+                if cross_fade_samples <= 0:
+                    final_wave = np.concatenate([prev_wave, next_wave])
+                    continue
+
+                prev_overlap = prev_wave[-cross_fade_samples:]
+                next_overlap = next_wave[:cross_fade_samples]
+
+                fade_out = np.linspace(1, 0, cross_fade_samples)
+                fade_in = np.linspace(0, 1, cross_fade_samples)
+
+                cross_faded_overlap = prev_overlap * fade_out + next_overlap * fade_in
+
+                final_wave = np.concatenate([
+                    prev_wave[:-cross_fade_samples],
+                    cross_faded_overlap,
+                    next_wave[cross_fade_samples:]
+                ])
+
+        return final_wave
+
+
+def chunk_text_v2(input, max_chars=120):
+    """
+    Chia text thành các đoạn nhỏ, dựa theo dấu chấm '.'
+    và đảm bảo mỗi đoạn không vượt quá max_chars ký tự.
+    """
+    chunks = []
+    current_chunk = ""
+
+    # Tách câu theo dấu chấm
+    sentences = re.split(r"\.", input)
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        sentence = sentence + "."  # thêm lại dấu chấm đã mất khi split
+
+        if len(current_chunk) + len(sentence) <= max_chars:
+            current_chunk += " " + sentence if current_chunk else sentence
+        else:
+            if current_chunk:
+                chunks.append(current_chunk.strip())
+            current_chunk = sentence
+
+    if current_chunk:
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+def split_long_sentences(text: str, max_len: int = 150) -> list[str]:
+    sentences = [s for s in text.split('.') if s]  # tách câu
+    result = []
+
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+
+        if len(sentence) <= max_len:
+            result.append(sentence)
+        else:
+            if ',' in sentence:  # tách theo dấu phẩy
+                parts = [p.strip() for p in sentence.split(',') if p.strip()]
+                for p in parts:
+                    result.append(p[0].upper() + p[1:] if p else p)
+            else:  # chia nhỏ theo từ, không vượt quá max_len
+                words = sentence.split()
+                current = []
+                length = 0
+                for word in words:
+                    if length + len(word) + (1 if current else 0) > max_len:
+                        part = " ".join(current)
+                        result.append(part[0].upper() + part[1:])
+                        current = [word]
+                        length = len(word)
+                    else:
+                        current.append(word)
+                        length += len(word) + (1 if current else 0)
+                if current:
+                    part = " ".join(current)
+                    result.append(part[0].upper() + part[1:])
+    return result
+
+

@@ -15,7 +15,7 @@ from f5tts_wrapper import F5TTSWrapper # Our handy wrapper class
 # --- Config ---
 # Path to the model checkpoint you downloaded from *this* repo
 # MAKE SURE this path points to the actual .pth or .ckpt file!
-eraX_ckpt_path = "model_423000.safetensors" # <-- CHANGE THIS!
+eraX_ckpt_path = "model_48000.safetensors" # <-- CHANGE THIS!
 
 # Path to the voice you want to clone
 ref_audio_path = "test_2.wav" # <-- CHANGE THIS!
@@ -93,18 +93,28 @@ for i, sentence in enumerate(sentences):
     #     # Tốc độ đọc: 1.0 = bình thường, >1.0 = nhanh hơn, <1.0 = chậm hơn (mặc định: 1.0)
     #     # Thời gian cross-fade (giảm/ tăng âm chồng nhau) khi text bị cắt thành nhiều chunk nhỏ. Giúp chuyển mượt mà (mặc định: 0.15 giây)
     # )
-    res = text_convert.convertTextToArrayTextLessThanXCharacter(sentence, 2000)
+    res = text_convert.convertTextToArrayTextLessThanXCharacter(sentence, 1500)
+    print("Res size " + str(len(res)))
     all_waves = []
+    i = 0
     for text in res:
         wav = tts.generate_wav_only(
-            text=sentence,
-            nfe_step=30,  # Denoising steps. More = slower but potentially better? (Default: 32)
-            cfg_strength=2,  # How strongly to stick to the reference voice style? (Default: 2.0)
+            text=text,
+            nfe_step=28,  # Denoising steps. More = slower but potentially better? (Default: 32)
+            cfg_strength=2.2,  # How strongly to stick to the reference voice style? (Default: 2.0)
             speed=1.0,  # Make it talk faster or slower (Default: 1.0)
             cross_fade_duration=0.15,  # Smooths transitions if text is split into chunks (Default: 0.15)
+
+            # ok : 30, 2.2, 1.0, 0.15
+            # Denoising steps. Nhiều bước hơn -> chậm hơn nhưng chất lượng giọng có thể mượt hơn (mặc định: 32)
+            # Mức độ bám sát giọng mẫu tham chiếu. Cao quá thì dễ bị méo, thấp quá thì giọng dễ khác mẫu (mặc định: 2.0)
+            # Tốc độ đọc: 1.0 = bình thường, >1.0 = nhanh hơn, <1.0 = chậm hơn (mặc định: 1.0)
+            # Thời gian cross-fade (giảm/ tăng âm chồng nhau) khi text bị cắt thành nhiều chunk nhỏ. Giúp chuyển mượt mà (mặc định: 0.15 giây)
         )
         all_waves.append(wav)
-        time.sleep(1)
+        time.sleep(2)
+        print("Đã xong đoạn thứ " + str(i + 1))
+        i += 1
 
     final_wave = np.concatenate(all_waves)
     final_wave = final_wave / np.max(np.abs(final_wave))

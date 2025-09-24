@@ -1,0 +1,12 @@
+server_config:
+  - id: "tts-1"
+    ip: "192.168.1.51"
+    port: 20915
+    user: "dts"
+    password: "dst1234"
+
+  - id: "tts-2"
+    ip: "192.168.1.54"
+    port: 2202
+    user: "dts"
+    password: "dst1234"
