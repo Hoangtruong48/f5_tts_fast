@@ -18,7 +18,8 @@ import paramiko
 import tempfile
 from fastapi.responses import JSONResponse
 import yaml
-
+import requests
+import os
 
 
 class TTSRequest(BaseModel):
@@ -50,9 +51,8 @@ app = FastAPI(title="TTS API")
 os.environ["CUDA_VISIBLE_DEVICES"] = "0"
 logger = logging.getLogger("tts_api")
 
-
 # Load model ngay khi khởi động server
-eraX_ckpt_path = "model_612000.safetensors"
+eraX_ckpt_path = "model_last.pt"
 vocab_file = "vocab.txt"
 ref_audio_path = "test_2.wav"
 text_file_ref = "ref_text.txt"
@@ -189,6 +189,7 @@ async def tts_endpoint(request: TTSRequestV2):
 @app.post("/tts-v3")
 async def tts_endpoint(request: TTSRequestV3):
     try:
+        print(request)
         server_id = request.server_id
         path = request.path
         speed = request.option.speed
@@ -228,7 +229,8 @@ async def tts_endpoint(request: TTSRequestV3):
         mp3_bytes = io.BytesIO()
         audio.export(mp3_bytes, format="mp3", bitrate="48k")
         mp3_bytes.seek(0)
-
+        file_size = mp3_bytes.getbuffer().nbytes
+        logger.info(f"Kích thước file BytesIO: {file_size} bytes")
         # Upload qua SSH
         # get config ssh
         server = get_server_config("config.yml", server_id)
@@ -237,24 +239,36 @@ async def tts_endpoint(request: TTSRequestV3):
         ssh_user = server["user"]
         ssh_password = server["password"]
 
-        print("Check SSH connection | host={ssh_host} | port={ssh_port} | user={ssh_user} | password={ssh_password}")
+        print("Check SSH connection" + str(ssh_host) + "port= " + str(ssh_port) + "user=" + str(ssh_user) +
+              "password=" + str(ssh_password))
 
         # xử lí path
         full_path = path
         file_name = os.path.basename(full_path)
         dir_path = os.path.dirname(full_path)
         try:
-            upload_bytesio_via_ssh(
-                mp3_bytes,
-                remote_dir=dir_path,
-                filename=file_name,
-                ssh_host=ssh_host,
-                ssh_user=ssh_user,
-                ssh_pass=ssh_password,
-                ssh_port=ssh_port
-            )
+            current_ip = get_public_ip()
+            print(current_ip)
+            if ssh_host == current_ip and ssh_port == 2202:
+                # Lưu trực tiếp
+                save_file_locally(mp3_bytes, dir_path, file_name)
+                print("Lưu file trực tiếp tại server hiện tại")
+            else:
+                print("Lưu file bằng ssh")
+                try:
+                    upload_bytesio_via_ssh(
+                        mp3_bytes,
+                        remote_dir=dir_path,
+                        filename=file_name,
+                        ssh_host=ssh_host,
+                        ssh_user=ssh_user,
+                        ssh_pass=ssh_password,
+                        ssh_port=ssh_port
+                    )
+                except Exception as ex:
+                    print("Exception : {}", ex)
         except Exception as e:
-            logger.error("Lỗi khi upload file SSH", exc_info=True)
+            print("Lỗi khi upload file SSH")
             return JSONResponse(
                 status_code=500,
                 content={"rc": -1, "rd": f"Lỗi upload SSH: {str(e)}"}
@@ -266,7 +280,7 @@ async def tts_endpoint(request: TTSRequestV3):
         )
 
     except Exception as e:
-        logger.error("Lỗi tổng quát trong endpoint /tts-v3", exc_info=True)
+        print("Lỗi tổng quát trong endpoint /tts-v3")
         return JSONResponse(
             status_code=500,
             content={"rc": -1, "rd": f"Lỗi hệ thống: {str(e)}"}
@@ -274,16 +288,16 @@ async def tts_endpoint(request: TTSRequestV3):
 
 
 def upload_bytesio_via_ssh(
-    file_bytes: io.BytesIO,
-    remote_dir: str,
-    filename: str,
-    ssh_host: str,
-    ssh_user: str,
-    ssh_pass: str,
-    ssh_port: int
+        file_bytes: io.BytesIO,
+        remote_dir: str,
+        filename: str,
+        ssh_host: str,
+        ssh_user: str,
+        ssh_pass: str,
+        ssh_port: int
 ):
     file_bytes.seek(0)
-    try :
+    try:
         transport = paramiko.Transport((ssh_host, ssh_port))
         transport.connect(username=ssh_user, password=ssh_pass)
         sftp = paramiko.SFTPClient.from_transport(transport)
@@ -309,6 +323,9 @@ def upload_bytesio_via_ssh(
         with sftp.file(remote_path, "wb") as remote_file:
             remote_file.write(file_bytes.read())
 
+        info = sftp.stat(remote_path)
+        print(f"Uploaded {remote_path} ({info.st_size} bytes) lên {ssh_host}")
+
         sftp.close()
         transport.close()
         print(f"Uploaded directly to {remote_path} on {ssh_host}")
@@ -333,3 +350,27 @@ def get_server_config(yaml_file: str, server_id: str):
                 "password": server.get("password")
             }
     raise ValueError(f"Server id '{server_id}' not found in config")
+
+
+def get_public_ip():
+    try:
+        return requests.get("https://api.ipify.org").text.strip()
+    except Exception:
+        print("Exception while get ip public")
+        return None
+
+
+def save_file_locally(file_bytes, dir_path, file_name):
+    # Nếu là BytesIO thì convert sang bytes
+    if isinstance(file_bytes, io.BytesIO):
+        file_bytes = file_bytes.getvalue()
+
+    os.makedirs(dir_path, exist_ok=True)
+    file_path = os.path.join(dir_path, file_name)
+    with open(file_path, "wb") as f:
+        f.write(file_bytes)
+
+    file_size = os.path.getsize(file_path)
+    print(f"File lưu tại: {file_path}, size = {file_size} bytes")
+
+    return file_path

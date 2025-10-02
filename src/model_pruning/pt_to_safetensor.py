@@ -33,6 +33,7 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
 def find_and_clean_state_dict(checkpoint):
     """
     Attempts to find the state_dict within a loaded checkpoint and clean its keys.
@@ -117,7 +118,6 @@ def find_and_clean_state_dict(checkpoint):
                  else:
                       logger.info(f"Ignoring EMA metadata key: '{k}'")
             state_dict = temp_dict # Use filtered dict
-
 
     # --- Standard Prefix Stripping ---
     possible_prefix = None
@@ -225,6 +225,7 @@ def convert_pt_to_safetensors(pt_path, sf_path):
         logger.warning(f"Could not compare file sizes: {e}")
 
     return True
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
